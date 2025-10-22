@@ -426,21 +426,22 @@ class Layout:
             path_map = self._build_hierarchy_paths()
 
             for layout, region in layout_regions:
-                layout._current_render_dims = (region.width, region.height)
-                layout._current_hierarchy_path = path_map.get(layout)
-                cached_lines = layout._get_cached_render()
-                if cached_lines is None:
-                    lines = render_lines(
-                        layout.renderable,
-                        update_dimensions(region.width, region.height),
-                    )
-                    layout._store_cached_render(lines)
-                    layout.evict_cache()
-                else:
-                    lines = cached_lines
-                render_map[layout] = LayoutRender(region, lines)
-                layout._current_render_dims = None
-                layout._current_hierarchy_path = None
+                with layout._lock:
+                    layout._current_render_dims = (region.width, region.height)
+                    layout._current_hierarchy_path = path_map.get(layout)
+                    cached_lines = layout._get_cached_render()
+                    if cached_lines is None:
+                        lines = render_lines(
+                            layout.renderable,
+                            update_dimensions(region.width, region.height),
+                        )
+                        layout._store_cached_render(lines)
+                        layout.evict_cache()
+                    else:
+                        lines = cached_lines
+                    render_map[layout] = LayoutRender(region, lines)
+                    layout._current_render_dims = None
+                    layout._current_hierarchy_path = None
 
             self._render_map = render_map
             self._render_cache[cache_key] = render_map
