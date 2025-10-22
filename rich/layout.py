@@ -1,5 +1,6 @@
 import hashlib
 import json
+from collections import OrderedDict
 from abc import ABC, abstractmethod
 from itertools import islice
 from operator import itemgetter
@@ -178,7 +179,7 @@ class Layout:
         self._render_map: RenderMap = {}
         self._lock = RLock()
         self._render_cache: Dict[str, Any] = {}
-        self._render_cache_order: List[str] = []
+        self._render_cache_order: "OrderedDict[str, None]" = OrderedDict()
         self._current_render_dims: Optional[Tuple[int, int]] = None
         self._current_hierarchy_path: Optional[str] = None
         self._last_render_key: Optional[str] = None
@@ -486,7 +487,7 @@ class Layout:
         """
         with self._lock:
             while len(self._render_cache_order) > max_entries:
-                eldest = self._render_cache_order.pop(0)
+                eldest, _ = self._render_cache_order.popitem(last=False)
                 self._render_cache.pop(eldest, None)
 
     def _touch_cache_key(self, key: str) -> None:
@@ -498,11 +499,8 @@ class Layout:
         Returns:
             None
         """
-        try:
-            self._render_cache_order.remove(key)
-        except ValueError:
-            pass
-        self._render_cache_order.append(key)
+        self._render_cache_order.pop(key, None)
+        self._render_cache_order[key] = None
 
     def _store_cached_render(self, lines: List[List[Segment]]) -> None:
         """Store rendered line segments for the current context.
