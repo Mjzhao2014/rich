@@ -218,6 +218,27 @@ class TestLayoutCache(unittest.TestCase):
         self.assertIn(hot_key, l._render_cache,
                       "Most recently used entry should remain after eviction")
 
+    def test_child_cache_auto_eviction(self):
+        """
+        Child layout caches are automatically trimmed during parent renders.
+        The leaf cache should not grow without bound when parent renders with
+        many distinct dimensions.
+        """
+        parent = Layout(name="parent")
+        child = Layout(name="child")
+        parent.split_column(child)
+        child.update(Text("steady"))
+
+        for width in range(60, 200):
+            console = Console(width=width, height=24, record=True)
+            parent.render(console, console.options)
+
+        self.assertLessEqual(
+            len(child._render_cache),
+            100,
+            "Child cache should be bounded by automatic eviction",
+        )
+
     #
     # Performance sanity (non-flaky)
     #

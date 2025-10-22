@@ -1,3 +1,5 @@
+import hashlib
+import json
 from abc import ABC, abstractmethod
 from itertools import islice
 from operator import itemgetter
@@ -11,6 +13,7 @@ from typing import (
     NamedTuple,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Union,
 )
@@ -432,6 +435,7 @@ class Layout:
                         update_dimensions(region.width, region.height),
                     )
                     layout._store_cached_render(lines)
+                    layout.evict_cache()
                 else:
                     lines = cached_lines
                 render_map[layout] = LayoutRender(region, lines)
@@ -592,7 +596,124 @@ class Layout:
                     style_bits.append(f"renderable.{attr}={value!r}")
         if not style_bits:
             return "none"
-        return "|".join(sorted(style_bits))
+        return ",".join(sorted(style_bits))
+
+    def _fingerprint_renderable(self, renderable: RenderableType) -> str:
+        """Generate a stable fingerprint for the supplied renderable.
+
+        Args:
+            renderable (RenderableType): Renderable being inspected.
+
+        Returns:
+            str: Type-qualified digest suitable for cache keys.
+        """
+        state = self._normalise_renderable_state(renderable)
+        try:
+            payload = json.dumps(
+                state, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            )
+        except Exception:
+            payload = repr(state)
+        digest = hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+        renderable_type = (
+            f"{type(renderable).__module__}.{type(renderable).__qualname__}"
+        )
+        return f"{renderable_type}:{digest}"
+
+    def _normalise_renderable_state(
+        self,
+        renderable: RenderableType,
+        *,
+        max_depth: int = 4,
+    ) -> Any:
+        """Convert a renderable into JSON-friendly primitives for hashing.
+
+        Args:
+            renderable (RenderableType): Renderable to normalise.
+            max_depth (int): Maximum recursion depth for traversal.
+
+        Returns:
+            Any: JSON-serialisable representation of renderable state.
+        """
+
+        def _normalise(value: Any, depth: int, seen: Set[int]) -> Any:
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            if isinstance(value, bytes):
+                return value.decode("utf-8", "replace")
+            if depth >= max_depth:
+                return f"<depth:{type(value).__name__}>"
+
+            value_id = id(value)
+            if value_id in seen:
+                return f"<cycle:{type(value).__name__}>"
+
+            seen.add(value_id)
+            try:
+                if isinstance(value, dict):
+                    return {
+                        str(key): _normalise(item, depth + 1, seen)
+                        for key, item in sorted(
+                            value.items(), key=lambda item: str(item[0])
+                        )
+                    }
+                if isinstance(value, (list, tuple)):
+                    return [
+                        _normalise(item, depth + 1, seen) for item in value
+                    ]
+                if isinstance(value, (set, frozenset)):
+                    return [
+                        _normalise(item, depth + 1, seen)
+                        for item in sorted(value, key=lambda item: repr(item))
+                    ]
+
+                if hasattr(value, "__rich_repr__"):
+                    try:
+                        parts = list(value.__rich_repr__())
+                    except Exception:
+                        parts = []
+                    else:
+                        return [
+                            _normalise(part, depth + 1, seen)
+                            if not isinstance(part, tuple)
+                            else [
+                                _normalise(component, depth + 1, seen)
+                                for component in part
+                            ]
+                            for part in parts
+                        ]
+
+                data: Dict[str, Any] = {}
+                if hasattr(value, "__dict__"):
+                    data.update(
+                        {
+                            str(key): _normalise(item, depth + 1, seen)
+                            for key, item in value.__dict__.items()
+                            if not callable(item)
+                        }
+                    )
+                slots = getattr(value, "__slots__", ())
+                if isinstance(slots, str):
+                    slots = (slots,)
+                for slot in slots:
+                    try:
+                        slot_value = getattr(value, slot)
+                    except AttributeError:
+                        continue
+                    data[str(slot)] = _normalise(
+                        slot_value, depth + 1, seen
+                    )
+                if data:
+                    data["__type__"] = (
+                        f"{type(value).__module__}.{type(value).__qualname__}"
+                    )
+                    return dict(sorted(data.items()))
+
+                return repr(value)
+            finally:
+                seen.discard(value_id)
+
+        return _normalise(renderable, 0, set())
 
     def _build_hierarchy_paths(self) -> Dict["Layout", str]:
         """Produce stable hierarchy paths for all descendants.
@@ -619,19 +740,18 @@ class Layout:
         """
         width, height = self._current_render_dims or self._last_render_dims or (0, 0)
         path = self._current_hierarchy_path or self._build_hierarchy_path()
-        identity = f"id={id(self)}"
         structure = (
             f"name={self.name!r};size={self.size!r};min={self.minimum_size};"
             f"ratio={self.ratio};visible={self.visible}"
         )
         renderable = self._renderable if not self._children else "<container>"
         try:
-            fingerprint = repr(renderable)
+            fingerprint = self._fingerprint_renderable(renderable)
         except Exception:
-            fingerprint = f"type={type(renderable)!r};addr={id(renderable)}"
+            fingerprint = f"type={type(renderable)!r}"
         style_signature = self._collect_style_signature(renderable)
         key = (
-            f"{identity}|path={path}|size={width}x{height}|struct={structure}|content={fingerprint}|style={style_signature}"
+            f"path={path}|size={width}x{height}|struct={structure}|content={fingerprint}|style={style_signature}"
         )
         return key
 
