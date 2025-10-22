@@ -4,6 +4,7 @@ from operator import itemgetter
 from threading import RLock
 from typing import (
     TYPE_CHECKING,
+    Any,
     Dict,
     Iterable,
     List,
@@ -173,6 +174,13 @@ class Layout:
         self._children: List[Layout] = []
         self._render_map: RenderMap = {}
         self._lock = RLock()
+        self._render_cache: Dict[str, Any] = {}
+        self._render_cache_order: List[str] = []
+        self._current_render_dims: Optional[Tuple[int, int]] = None
+        self._current_hierarchy_path: Optional[str] = None
+        self._last_render_key: Optional[str] = None
+        self._last_render_dims: Optional[Tuple[int, int]] = None
+        self._parent: Optional["Layout"] = None
 
     def __rich_repr__(self) -> Result:
         yield "name", self.name, None
@@ -281,7 +289,12 @@ class Layout:
             )
         except KeyError:
             raise NoSplitter(f"No splitter called {splitter!r}")
+        for child in self._children:
+            child._parent = None
         self._children[:] = _layouts
+        for child in self._children:
+            child._parent = self
+        self.invalidate_cache()
 
     def add_split(self, *layouts: Union["Layout", RenderableType]) -> None:
         """Add a new layout(s) to existing split.
@@ -290,11 +303,14 @@ class Layout:
             *layouts (Union[Layout, RenderableType]): Positional arguments should be renderables or (sub) Layout instances.
 
         """
-        _layouts = (
+        _layouts = [
             layout if isinstance(layout, Layout) else Layout(layout)
             for layout in layouts
-        )
+        ]
+        for layout in _layouts:
+            layout._parent = self
         self._children.extend(_layouts)
+        self.invalidate_cache()
 
     def split_row(self, *layouts: Union["Layout", RenderableType]) -> None:
         """Split the layout in to a row (layouts side by side).
@@ -314,7 +330,10 @@ class Layout:
 
     def unsplit(self) -> None:
         """Reset splits to initial state."""
+        for child in self._children:
+            child._parent = None
         del self._children[:]
+        self.invalidate_cache()
 
     def update(self, renderable: RenderableType) -> None:
         """Update renderable.
@@ -324,6 +343,7 @@ class Layout:
         """
         with self._lock:
             self._renderable = renderable
+            self.invalidate_cache()
 
     def refresh_screen(self, console: "Console", layout_name: str) -> None:
         """Refresh a sub-layout.
@@ -375,22 +395,266 @@ class Layout:
         """
         render_width = options.max_width
         render_height = options.height or console.height
-        region_map = self._make_region_map(render_width, render_height)
-        layout_regions = [
-            (layout, region)
-            for layout, region in region_map.items()
-            if not layout.children
-        ]
-        render_map: Dict["Layout", "LayoutRender"] = {}
-        render_lines = console.render_lines
-        update_dimensions = options.update_dimensions
 
-        for layout, region in layout_regions:
-            lines = render_lines(
-                layout.renderable, update_dimensions(region.width, region.height)
-            )
-            render_map[layout] = LayoutRender(region, lines)
-        return render_map
+        with self._lock:
+            self._current_render_dims = (render_width, render_height)
+            self._current_hierarchy_path = "root"
+            cache_key = self._generate_cache_key()
+            cached_map = self._render_cache.get(cache_key)
+            if isinstance(cached_map, dict):
+                self._touch_cache_key(cache_key)
+                self._render_map = cached_map  # type: ignore[assignment]
+                self._last_render_key = cache_key
+                self._last_render_dims = (render_width, render_height)
+                self._current_render_dims = None
+                self._current_hierarchy_path = None
+                return cached_map  # type: ignore[return-value]
+
+            region_map = self._make_region_map(render_width, render_height)
+            layout_regions = [
+                (layout, region)
+                for layout, region in region_map.items()
+                if not layout.children
+            ]
+            render_map: Dict["Layout", "LayoutRender"] = {}
+            render_lines = console.render_lines
+            update_dimensions = options.update_dimensions
+
+            path_map = self._build_hierarchy_paths()
+
+            for layout, region in layout_regions:
+                layout._current_render_dims = (region.width, region.height)
+                layout._current_hierarchy_path = path_map.get(layout)
+                cached_lines = layout._get_cached_render()
+                if cached_lines is None:
+                    lines = render_lines(
+                        layout.renderable,
+                        update_dimensions(region.width, region.height),
+                    )
+                    layout._store_cached_render(lines)
+                else:
+                    lines = cached_lines
+                render_map[layout] = LayoutRender(region, lines)
+                layout._current_render_dims = None
+                layout._current_hierarchy_path = None
+
+            self._render_map = render_map
+            self._render_cache[cache_key] = render_map
+            self._touch_cache_key(cache_key)
+            self._last_render_key = cache_key
+            self._last_render_dims = (render_width, render_height)
+            self.evict_cache()
+            self._current_render_dims = None
+            self._current_hierarchy_path = None
+            return render_map
+
+    def cache_rendered_output(self) -> None:
+        """Persist the most recent render map in the cache.
+
+        Returns:
+            None: This method is a no-op when no render data is available.
+        """
+        if self._last_render_key is None:
+            return
+        if self._last_render_key not in self._render_cache and self._render_map:
+            self._render_cache[self._last_render_key] = self._render_map
+        self._touch_cache_key(self._last_render_key)
+
+    def invalidate_cache(self) -> None:
+        """Invalidate cached renders for this layout and its ancestors.
+
+        Returns:
+            None: Cache structures are cleared in place.
+        """
+        with self._lock:
+            self._invalidate_cache()
+        self._invalidate_parent_caches()
+
+    def evict_cache(self, max_entries: int = 100) -> None:
+        """Remove least-recently-used cache entries beyond ``max_entries``.
+
+        Args:
+            max_entries (int): Maximum number of entries to retain.
+
+        Returns:
+            None
+        """
+        with self._lock:
+            while len(self._render_cache_order) > max_entries:
+                eldest = self._render_cache_order.pop(0)
+                self._render_cache.pop(eldest, None)
+
+    def _touch_cache_key(self, key: str) -> None:
+        """Mark a cache key as most recently used.
+
+        Args:
+            key (str): Cache key to update in the LRU tracker.
+
+        Returns:
+            None
+        """
+        try:
+            self._render_cache_order.remove(key)
+        except ValueError:
+            pass
+        self._render_cache_order.append(key)
+
+    def _store_cached_render(self, lines: List[List[Segment]]) -> None:
+        """Store rendered line segments for the current context.
+
+        Args:
+            lines (List[List[Segment]]): Rendered segments grouped by line.
+
+        Returns:
+            None
+        """
+        key = self._generate_cache_key()
+        self._render_cache[key] = lines
+        self._touch_cache_key(key)
+        self._last_render_key = key
+        if self._current_render_dims is not None:
+            self._last_render_dims = self._current_render_dims
+
+    def _get_cached_render(self) -> Optional[List[List[Segment]]]:
+        """Return cached line segments for the current render context.
+
+        Returns:
+            Optional[List[List[Segment]]]: Cached segments if present.
+        """
+        if self._current_render_dims is None:
+            return None
+        key = self._generate_cache_key()
+        cached = self._render_cache.get(key)
+        if isinstance(cached, list):
+            self._touch_cache_key(key)
+            self._last_render_key = key
+            return cached
+        return None
+
+    def _invalidate_cache(self, recursive: bool = True) -> None:
+        """Clear cached data for this layout.
+
+        Args:
+            recursive (bool): When ``True`` also clear descendant caches.
+
+        Returns:
+            None
+        """
+        self._render_cache.clear()
+        self._render_cache_order.clear()
+        self._last_render_key = None
+        self._last_render_dims = None
+        self._render_map = {}
+        if recursive:
+            for child in self._children:
+                with child._lock:
+                    child._invalidate_cache(recursive=True)
+
+    def _invalidate_parent_caches(self) -> None:
+        """Propagate invalidation to ancestor layouts without touching siblings.
+
+        Returns:
+            None
+        """
+        parent = self._parent
+        if parent is None:
+            return
+        with parent._lock:
+            parent._invalidate_cache(recursive=False)
+        parent._invalidate_parent_caches()
+
+    def _collect_style_signature(self, renderable: RenderableType) -> str:
+        """Build a descriptive signature of layout and renderable styles.
+
+        Args:
+            renderable (RenderableType): Renderable associated with this layout.
+
+        Returns:
+            str: Stable textual summary of relevant style attributes.
+        """
+        style_bits: List[str] = []
+        style_attrs = ("style", "border_style", "highlight", "box", "padding")
+        for attr in style_attrs:
+            if hasattr(self, attr):
+                try:
+                    value = getattr(self, attr)
+                except Exception:
+                    value = None
+                if value is not None:
+                    style_bits.append(f"layout.{attr}={value!r}")
+        for attr in style_attrs:
+            if hasattr(renderable, attr):
+                try:
+                    value = getattr(renderable, attr)
+                except Exception:
+                    value = None
+                if value is not None:
+                    style_bits.append(f"renderable.{attr}={value!r}")
+        if not style_bits:
+            return "none"
+        return "|".join(sorted(style_bits))
+
+    def _build_hierarchy_paths(self) -> Dict["Layout", str]:
+        """Produce stable hierarchy paths for all descendants.
+
+        Returns:
+            Dict[Layout, str]: Mapping of layout nodes to their hierarchy path.
+        """
+        paths: Dict["Layout", str] = {self: "root"}
+
+        def _recurse(node: "Layout", prefix: str) -> None:
+            for index, child in enumerate(node._children):
+                child_path = f"{prefix}/{index}"
+                paths[child] = child_path
+                _recurse(child, child_path)
+
+        _recurse(self, "root")
+        return paths
+
+    def _generate_cache_key(self) -> str:
+        """Generate a cache key capturing identity and render context.
+
+        Returns:
+            str: Deterministic cache key for the active render context.
+        """
+        width, height = self._current_render_dims or self._last_render_dims or (0, 0)
+        path = self._current_hierarchy_path or self._build_hierarchy_path()
+        identity = f"id={id(self)}"
+        structure = (
+            f"name={self.name!r};size={self.size!r};min={self.minimum_size};"
+            f"ratio={self.ratio};visible={self.visible}"
+        )
+        renderable = self._renderable if not self._children else "<container>"
+        try:
+            fingerprint = repr(renderable)
+        except Exception:
+            fingerprint = f"type={type(renderable)!r};addr={id(renderable)}"
+        style_signature = self._collect_style_signature(renderable)
+        key = (
+            f"{identity}|path={path}|size={width}x{height}|struct={structure}|content={fingerprint}|style={style_signature}"
+        )
+        return key
+
+    def _build_hierarchy_path(self) -> str:
+        """Compute the path of this layout within its parent tree.
+
+        Returns:
+            str: Hierarchy path identifying the layout.
+        """
+        segments: List[str] = []
+        node: Optional["Layout"] = self
+        while node is not None:
+            parent = node._parent
+            if parent is None:
+                segments.append("root")
+                break
+            try:
+                index = parent._children.index(node)
+            except ValueError:
+                index = -1
+            segments.append(str(index))
+            node = parent
+        return "/".join(reversed(segments))
 
     def __rich_console__(
         self, console: Console, options: ConsoleOptions
